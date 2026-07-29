@@ -4,6 +4,8 @@
 from .allreduce_norm import *
 from .boxes import *
 from .checkpoint import load_ckpt, save_checkpoint
+from .class_analytics import generate_class_analytics_report
+from .training_report import TrainingReport
 from .compat import meshgrid
 from .demo_utils import *
 from .dist import *

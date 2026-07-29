@@ -60,6 +60,7 @@ class Trainer:
         # metric record
         self.meter = MeterBuffer(window_size=exp.print_interval)
         self.file_name = os.path.join(exp.output_dir, args.experiment_name)
+        self.training_report = None
 
         if self.rank == 0:
             os.makedirs(self.file_name, exist_ok=True)
@@ -135,10 +136,25 @@ class Trainer:
         # model related init
         torch.cuda.set_device(self.local_rank)
         model = self.exp.get_model()
-        logger.info(
-            "Model Summary: {}".format(get_model_info(model, self.exp.test_size))
-        )
+        model_info = get_model_info(model, self.exp.test_size)
+        logger.info("Model Summary: {}".format(model_info))
         model.to(self.device)
+
+        # Training report package + class analytics (rank0 only)
+        if self.rank == 0:
+            try:
+                from yolox.utils.training_report import TrainingReport
+
+                self.training_report = TrainingReport(self.file_name, self.exp, self.args)
+                self.training_report.start(model_info=model_info)
+                logger.info(
+                    "Training report folder: {}".format(self.training_report.report_dir)
+                )
+            except Exception as e:
+                self.training_report = None
+                logger.warning(
+                    "Training report init failed (continuing train): {}".format(e)
+                )
 
         # solver related init
         self.optimizer = self.exp.get_optimizer(self.args.batch_size)
@@ -201,6 +217,12 @@ class Trainer:
             "Training of experiment is done and the best AP is {:.2f}".format(self.best_ap * 100)
         )
         if self.rank == 0:
+            if self.training_report is not None:
+                try:
+                    report_dir = self.training_report.finalize()
+                    logger.info("Final training report saved to: {}".format(report_dir))
+                except Exception as e:
+                    logger.warning("Training report finalize failed: {}".format(e))
             if self.args.logger == "wandb":
                 self.wandb_logger.finish()
             elif self.args.logger == "mlflow":
@@ -231,6 +253,23 @@ class Trainer:
 
     def after_epoch(self):
         self.save_ckpt(ckpt_name="latest")
+
+        if self.rank == 0 and self.training_report is not None:
+            try:
+                iter_t = self.meter["iter_time"].global_avg or 0.0
+                fps = (1.0 / iter_t) if iter_t > 0 else 0.0
+                left_iters = self.max_iter * self.max_epoch - (self.progress_in_iter + 1)
+                eta_seconds = (self.meter["iter_time"].global_avg or 0.0) * left_iters
+                eta_str = str(datetime.timedelta(seconds=int(eta_seconds)))
+                self.training_report.end_epoch(
+                    epoch=self.epoch + 1,
+                    lr=float(self.meter["lr"].latest or 0.0),
+                    fps=fps,
+                    gpu_mb=float(gpu_mem_usage()),
+                    eta=eta_str,
+                )
+            except Exception as e:
+                logger.warning("Training report epoch log failed: {}".format(e))
 
         if (self.epoch + 1) % self.exp.eval_interval == 0:
             all_reduce_norm(self.model)
@@ -279,6 +318,20 @@ class Trainer:
             )
 
             if self.rank == 0:
+                if self.training_report is not None:
+                    try:
+                        losses = {k: float(v.latest) for k, v in loss_meter.items()}
+                        self.training_report.log_iter(
+                            epoch=self.epoch + 1,
+                            iteration=self.iter + 1,
+                            lr=float(self.meter["lr"].latest or 0.0),
+                            losses=losses,
+                            gpu_mb=float(gpu_mem_usage()),
+                            mem_gb=float(mem_usage()),
+                            iter_time=float(self.meter["iter_time"].avg or 0.0),
+                        )
+                    except Exception as e:
+                        logger.warning("Training report iter log failed: {}".format(e))
                 if self.args.logger == "tensorboard":
                     self.tblogger.add_scalar(
                         "train/lr", self.meter["lr"].latest, self.progress_in_iter)
@@ -379,6 +432,19 @@ class Trainer:
                 }
                 self.mlflow_logger.on_log(self.args, self.exp, self.epoch+1, logs)
             logger.info("\n" + summary)
+            if self.training_report is not None:
+                try:
+                    self.training_report.log_eval(
+                        epoch=self.epoch + 1,
+                        ap50=float(ap50),
+                        ap50_95=float(ap50_95),
+                        summary=str(summary) if summary is not None else "",
+                        predictions=predictions,
+                        is_best=bool(update_best_ckpt),
+                        ckpt_dir=self.file_name,
+                    )
+                except Exception as e:
+                    logger.warning("Training report eval log failed: {}".format(e))
         synchronize()
 
         self.save_ckpt("last_epoch", update_best_ckpt, ap=ap50_95)

@@ -4,5 +4,13 @@
 
 # VOC_CLASSES = ( '__background__', # always index 0
 VOC_CLASSES = (
-    "license_plate",
+    "auto",
+    "bike",
+    "car",
+    "disinfection",
+    "jcb",
+    "person",
+    "security_guard",
+    "tractor",
+    "truck",
 )
