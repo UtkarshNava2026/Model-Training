@@ -205,7 +205,8 @@ class VOCDetection(CacheDataset):
             img = cv2.imread(jpeg_path, cv2.IMREAD_COLOR)
             if img is None:
                 raise FileNotFoundError(
-                    f"Image file not found for id={img_id[1]}. Tried '{img_path}' and '{jpeg_path}'."
+                    f"Image file not found for id={img_id[1]}. "
+                    f"Tried '{img_path}' and '{jpeg_path}'."
                 )
 
         return img
