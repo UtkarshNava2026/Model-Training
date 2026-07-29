@@ -159,10 +159,59 @@ def preproc(img, input_size, swap=(2, 0, 1)):
 
 
 class TrainTransform:
-    def __init__(self, max_labels=50, flip_prob=0.5, hsv_prob=1.0):
+    def __init__(self, max_labels=50, flip_prob=0.5, hsv_prob=1.0, weather_prob=0.0):
         self.max_labels = max_labels
         self.flip_prob = flip_prob
         self.hsv_prob = hsv_prob
+        # Independently apply heavy rain and fog, each with this probability.
+        self.weather_prob = weather_prob
+        self.rain_tf = None
+        self.fog_tf = None
+        if weather_prob > 0:
+            import albumentations as A
+
+            # Photometric only (uint8 0-255). Boxes are unchanged.
+            self.rain_tf = A.Compose(
+                [
+                    A.RandomRain(
+                        slant_range=(-3, 4),
+                        drop_length=25,
+                        drop_width=1,
+                        drop_color=(100, 100, 100),
+                        blur_value=3,
+                        brightness_coefficient=0.92,
+                        rain_type="heavy",
+                        p=1.0,
+                    ),
+                ]
+            )
+            self.fog_tf = A.Compose(
+                [
+                    A.RandomFog(
+                        fog_coef_range=(0.25, 0.35),
+                        alpha_coef=0.08,
+                        p=1.0,
+                    ),
+                ]
+            )
+
+    def _apply_weather(self, image):
+        """Apply heavy rain and fog independently on uint8 BGR. No normalization."""
+        if self.weather_prob <= 0:
+            return image
+
+        apply_rain = self.rain_tf is not None and random.random() < self.weather_prob
+        apply_fog = self.fog_tf is not None and random.random() < self.weather_prob
+        if not apply_rain and not apply_fog:
+            return image
+
+        rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        if apply_rain:
+            rgb = self.rain_tf(image=rgb)["image"]
+        if apply_fog:
+            rgb = self.fog_tf(image=rgb)["image"]
+        image[:] = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        return image
 
     def __call__(self, image, targets, input_dim):
         boxes = targets[:, :4].copy()
@@ -182,6 +231,7 @@ class TrainTransform:
 
         if random.random() < self.hsv_prob:
             augment_hsv(image)
+        self._apply_weather(image)
         image_t, boxes = _mirror(image, boxes, self.flip_prob)
         height, width, _ = image_t.shape
         image_t, r_ = preproc(image_t, input_dim)

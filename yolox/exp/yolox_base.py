@@ -55,6 +55,8 @@ class Exp(BaseExp):
         self.hsv_prob = 1.0
         # prob of applying flip aug
         self.flip_prob = 0.5
+        # prob of applying Albumentations rain/fog (uint8, no normalize)
+        self.weather_prob = 0.0
         # rotation angle range, for example, if set to 2, the true range is (-2, 2)
         self.degrees = 10.0
         # translate range, for example, if set to 0.1, the true range is (-0.1, 0.1)
@@ -146,7 +148,8 @@ class Exp(BaseExp):
             preproc=TrainTransform(
                 max_labels=50,
                 flip_prob=self.flip_prob,
-                hsv_prob=self.hsv_prob
+                hsv_prob=self.hsv_prob,
+                weather_prob=self.weather_prob,
             ),
             cache=cache,
             cache_type=cache_type,
@@ -187,7 +190,8 @@ class Exp(BaseExp):
             preproc=TrainTransform(
                 max_labels=120,
                 flip_prob=self.flip_prob,
-                hsv_prob=self.hsv_prob),
+                hsv_prob=self.hsv_prob,
+                weather_prob=self.weather_prob),
             degrees=self.degrees,
             translate=self.translate,
             mosaic_scale=self.mosaic_scale,

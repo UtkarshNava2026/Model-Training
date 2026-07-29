@@ -162,6 +162,19 @@ class VOCDetection(CacheDataset):
         res, img_info = self.target_transform(target)
         height, width = img_info
 
+        # Some datasets contain invalid XML sizes (e.g. width/height=0).
+        # Fall back to the actual image size to avoid divide-by-zero.
+        if height <= 0 or width <= 0:
+            img = self.load_image(index)
+            height, width = img.shape[:2]
+            img_info = (height, width)
+
+        if height <= 0 or width <= 0:
+            raise ValueError(
+                f"Invalid image size (height={height}, width={width}) for id={img_id[1]}. "
+                f"Check annotation file '{self._annopath % img_id}'."
+            )
+
         r = min(self.img_size[0] / height, self.img_size[1] / width)
         res[:, :4] *= r
         resized_info = (int(height * r), int(width * r))
@@ -184,8 +197,16 @@ class VOCDetection(CacheDataset):
 
     def load_image(self, index):
         img_id = self.ids[index]
-        img = cv2.imread(self._imgpath % img_id, cv2.IMREAD_COLOR)
-        assert img is not None, f"file named {self._imgpath % img_id} not found"
+        img_path = self._imgpath % img_id
+        img = cv2.imread(img_path, cv2.IMREAD_COLOR)
+        if img is None:
+            # Some VOC-like datasets store images as .jpeg instead of .jpg
+            jpeg_path = os.path.splitext(img_path)[0] + ".jpeg"
+            img = cv2.imread(jpeg_path, cv2.IMREAD_COLOR)
+            if img is None:
+                raise FileNotFoundError(
+                    f"Image file not found for id={img_id[1]}. Tried '{img_path}' and '{jpeg_path}'."
+                )
 
         return img
 
@@ -261,7 +282,7 @@ class VOCDetection(CacheDataset):
                 for im_ind, index in enumerate(self.ids):
                     index = index[1]
                     dets = all_boxes[cls_ind][im_ind]
-                    if dets == []:
+                    if dets is None or len(dets) == 0:
                         continue
                     for k in range(dets.shape[0]):
                         f.write(

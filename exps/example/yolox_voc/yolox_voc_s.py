@@ -18,6 +18,8 @@ class Exp(MyExp):
         self.mixup_prob = 1.0
         self.hsv_prob = 1.0
         self.flip_prob = 0.5
+        # Albumentations: heavy rain and fog each on ~10% of samples (independent)
+        self.weather_prob = 0.1
 
         self.exp_name = os.path.split(os.path.realpath(__file__))[1].split(".")[0]
 
@@ -31,7 +33,8 @@ class Exp(MyExp):
             preproc=TrainTransform(
                 max_labels=50,
                 flip_prob=self.flip_prob,
-                hsv_prob=self.hsv_prob),
+                hsv_prob=self.hsv_prob,
+                weather_prob=self.weather_prob),
             cache=cache,
             cache_type=cache_type,
         )
