@@ -57,6 +57,8 @@ class Exp(BaseExp):
         self.flip_prob = 0.5
         # prob of applying Albumentations rain/fog (uint8, no normalize)
         self.weather_prob = 0.0
+        # class ids that must never receive fog augmentation (empty = fog any sample)
+        self.no_fog_class_ids = ()
         # rotation angle range, for example, if set to 2, the true range is (-2, 2)
         self.degrees = 10.0
         # translate range, for example, if set to 0.1, the true range is (-0.1, 0.1)
@@ -67,6 +69,9 @@ class Exp(BaseExp):
         self.mixup_scale = (0.5, 1.5)
         # shear angle range, for example, if set to 2, the true range is (-2, 2)
         self.shear = 2.0
+        # drop boxes whose area after mosaic crop / affine clip is below this fraction of
+        # their un-clipped area (0 disables, i.e. original YOLOX behaviour)
+        self.min_box_area_ratio = 0.0
 
         # --------------  training config --------------------- #
         # epoch number used for warmup
@@ -150,6 +155,7 @@ class Exp(BaseExp):
                 flip_prob=self.flip_prob,
                 hsv_prob=self.hsv_prob,
                 weather_prob=self.weather_prob,
+                no_fog_class_ids=getattr(self, "no_fog_class_ids", ()),
             ),
             cache=cache,
             cache_type=cache_type,
@@ -191,7 +197,8 @@ class Exp(BaseExp):
                 max_labels=120,
                 flip_prob=self.flip_prob,
                 hsv_prob=self.hsv_prob,
-                weather_prob=self.weather_prob),
+                weather_prob=self.weather_prob,
+                no_fog_class_ids=getattr(self, "no_fog_class_ids", ())),
             degrees=self.degrees,
             translate=self.translate,
             mosaic_scale=self.mosaic_scale,
@@ -200,6 +207,7 @@ class Exp(BaseExp):
             enable_mixup=self.enable_mixup,
             mosaic_prob=self.mosaic_prob,
             mixup_prob=self.mixup_prob,
+            min_box_area_ratio=getattr(self, "min_box_area_ratio", 0.0),
         )
 
         if is_distributed:

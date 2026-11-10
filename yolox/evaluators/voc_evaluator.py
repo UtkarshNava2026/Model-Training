@@ -183,5 +183,12 @@ class VOCEvaluator:
             sys.stdout.flush()
 
         with tempfile.TemporaryDirectory() as tempdir:
-            mAP50, mAP70 = self.dataloader.dataset.evaluate_detections(all_boxes, tempdir)
-            return mAP50, mAP70, info
+            # NOTE: returns (mAP@50:95, mAP@50) despite the old variable names
+            map50_95, map50 = self.dataloader.dataset.evaluate_detections(all_boxes, tempdir)
+        self.per_class_ap = getattr(self.dataloader.dataset, "per_class_ap", None)
+        if self.per_class_ap:
+            info += "per-class AP50 / AP50:95:\n"
+            for c, v in self.per_class_ap.items():
+                info += "  {:<16} {:6.2f} / {:6.2f}\n".format(
+                    c, 100 * v["ap50"], 100 * v["ap50_95"])
+        return map50_95, map50, info

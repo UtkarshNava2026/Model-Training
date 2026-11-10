@@ -86,6 +86,7 @@ class TrainingReport:
         self._epoch_loss_counts = defaultdict(int)
         self._last_predictions = None
         self._last_eval_summary = ""
+        self.per_class_rows: List[Dict[str, Any]] = []
         self.best_ap = 0.0
         self.best_ckpt_info: Dict[str, Any] = {
             "checkpoint": "best_ckpt.pth",
@@ -102,6 +103,7 @@ class TrainingReport:
             "class_analysis": os.path.join(self.report_dir, "class_analysis.csv"),
             "dataset_summary": os.path.join(self.report_dir, "dataset_summary.json"),
             "best_checkpoint": os.path.join(self.report_dir, "best_checkpoint.json"),
+            "per_class_ap": os.path.join(self.report_dir, "per_class_ap.csv"),
             "lr_curve": os.path.join(self.report_dir, "lr_curve.png"),
             "loss_curve": os.path.join(self.report_dir, "loss_curve.png"),
             "ap_curve": os.path.join(self.report_dir, "ap_curve.png"),
@@ -254,7 +256,8 @@ class TrainingReport:
             "epoch": epoch,
             "train_loss": round(avg("total_loss", ["loss"]), 4),
             "iou_loss": round(avg("iou_loss"), 4),
-            "obj_loss": round(avg("obj_loss"), 4),
+            # YOLOX logs objectness loss as "conf_loss"
+            "obj_loss": round(avg("obj_loss", ["conf_loss"]), 4),
             "cls_loss": round(avg("cls_loss"), 4),
             "lr": round(_safe_float(lr), 6),
             "ap50": "" if ap50 is None else round(_safe_float(ap50) * 100.0, 2),
@@ -298,8 +301,17 @@ class TrainingReport:
         recall: Optional[float] = None,
         is_best: bool = False,
         ckpt_dir: Optional[str] = None,
+        per_class_ap: Optional[Dict[str, Dict[str, float]]] = None,
+        selection_metric: str = "ap50_95",
+        selection_score: Optional[float] = None,
     ):
         ap50_f = _safe_float(ap50)
+        if per_class_ap:
+            self.per_class_rows.append({"epoch": int(epoch), **{
+                f"{c}_{k}": round(100.0 * v[k], 2)
+                for c, v in per_class_ap.items() for k in ("ap50", "ap50_95")
+            }})
+            self._write_per_class_ap()
         ap50_95_f = _safe_float(ap50_95)
         self.best_ap = max(self.best_ap, ap50_95_f)
         self._last_eval_summary = summary or ""
@@ -350,7 +362,13 @@ class TrainingReport:
                 "epoch": int(epoch),
                 "ap50": round(ap50_f * 100.0, 2),
                 "ap50_95": round(ap50_95_f * 100.0, 2),
-                "selection_metric": "ap50_95",
+                "selection_metric": selection_metric,
+                "selection_score": None if selection_score is None
+                else round(100.0 * selection_score, 2),
+                "per_class_ap": None if not per_class_ap else {
+                    c: {k: round(100.0 * v[k], 2) for k in ("ap50", "ap50_95")}
+                    for c, v in per_class_ap.items()
+                },
                 "updated_at": datetime.now().isoformat(timespec="seconds"),
             }
             self._write_best_checkpoint()
@@ -385,6 +403,16 @@ class TrainingReport:
             w = csv.DictWriter(f, fieldnames=fields)
             w.writeheader()
             for row in self.epoch_rows:
+                w.writerow(row)
+
+    def _write_per_class_ap(self):
+        if not self.per_class_rows:
+            return
+        fields = ["epoch"] + [k for k in self.per_class_rows[-1].keys() if k != "epoch"]
+        with open(self.paths["per_class_ap"], "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=fields)
+            w.writeheader()
+            for row in self.per_class_rows:
                 w.writerow(row)
 
     def _write_gpu_usage(self):
@@ -479,14 +507,24 @@ class TrainingReport:
     def _compute_detection_stats(
         self, predictions, iou_thr: float = 0.5
     ) -> Tuple[np.ndarray, List[float], List[float], float, float]:
-        """Return confusion, per-class precision/recall, micro P/R."""
+        """Confusion matrix + per-class / micro P/R at the deployment score threshold.
+
+        * PR curves use ALL detections (that is what a PR curve is).
+        * Confusion matrix, P and R use only detections with score >= exp.report_conf_thre
+          (default 0.3). The old version used the eval threshold (0.01), so most
+          "false positives" were low-score boxes nobody deploys with.
+        * Matching is cross-class: a prediction that hits a GT of ANOTHER class (IoU>=0.5)
+          is counted as confusion [pred_cls, gt_cls] instead of background, so e.g.
+          person boxes fired on security guards show up as person->security_guard.
+        """
         from yolox.data import get_yolox_datadir
         from yolox.data.datasets.voc import VOCDetection
         from yolox.data.data_augment import ValTransform
 
         num_classes = len(self.class_names)
+        conf_thr = float(getattr(self.exp, "report_conf_thre", 0.3))
+        self.report_conf_thr = conf_thr
         conf = np.zeros((num_classes + 1, num_classes + 1), dtype=np.int32)  # + BG
-        # Build GT index: dataset index -> list of (cls, box)
         dataset = VOCDetection(
             data_dir=os.path.join(get_yolox_datadir(), "VOCdevkit"),
             image_sets=[("2012", "valid")],
@@ -494,93 +532,90 @@ class TrainingReport:
             preproc=ValTransform(legacy=False),
         )
 
-        precisions = []
-        recalls = []
-        tp_all = fp_all = fn_all = 0
-
-        # score lists for PR curve (binary: detected object vs not) per class
+        gt_count = np.zeros(num_classes, dtype=np.int64)
         scores_by_cls = [[] for _ in range(num_classes)]
         matched_by_cls = [[] for _ in range(num_classes)]
 
         for idx in range(len(dataset)):
-            pred = None
-            if isinstance(predictions, dict):
-                pred = predictions.get(int(idx))
-            if pred is None:
+            pred = predictions.get(int(idx)) if isinstance(predictions, dict) else None
+            if pred is None or pred[0] is None:
                 bboxes = np.zeros((0, 4))
                 pcls = np.zeros((0,), dtype=int)
                 scores = np.zeros((0,))
             else:
-                bboxes, pcls, scores = pred
-                if bboxes is None:
-                    bboxes = np.zeros((0, 4))
-                    pcls = np.zeros((0,), dtype=int)
-                    scores = np.zeros((0,))
-                else:
-                    bboxes = np.asarray(bboxes)
-                    pcls = np.asarray(pcls).astype(int)
-                    scores = np.asarray(scores)
+                bboxes = np.asarray(pred[0])
+                pcls = np.asarray(pred[1]).astype(int)
+                scores = np.asarray(pred[2])
 
-            # Predictions are in original image coords; annotations are resized.
             ann, (h0, w0), _ = dataset.annotations[idx]
             if len(ann):
-                r = min(
-                    float(dataset.img_size[0]) / float(h0),
-                    float(dataset.img_size[1]) / float(w0),
-                )
+                r = min(float(dataset.img_size[0]) / float(h0),
+                        float(dataset.img_size[1]) / float(w0))
                 gt_boxes = ann[:, :4] / max(r, 1e-6)
                 gt_cls = ann[:, 4].astype(int)
             else:
                 gt_boxes = np.zeros((0, 4), dtype=np.float32)
                 gt_cls = np.zeros((0,), dtype=int)
+            for g in gt_cls:
+                if 0 <= g < num_classes:
+                    gt_count[g] += 1
 
-            matched_gt = set()
             order = np.argsort(-scores) if len(scores) else []
+            ious = [_bbox_iou(bboxes[pi], gt_boxes) for pi in range(len(scores))]
+
+            # pass 1: PR curve data, same-class greedy matching, all scores
+            matched = set()
             for pi in order:
-                cls_p = int(pcls[pi])
-                if cls_p < 0 or cls_p >= num_classes:
+                cp = int(pcls[pi])
+                if cp < 0 or cp >= num_classes:
                     continue
-                iou = _bbox_iou(bboxes[pi], gt_boxes)
-                best = -1
-                best_iou = 0.0
-                for gi, iou_v in enumerate(iou):
-                    if gi in matched_gt:
-                        continue
-                    if int(gt_cls[gi]) != cls_p:
-                        continue
-                    if iou_v > best_iou:
-                        best_iou = iou_v
-                        best = gi
-                scores_by_cls[cls_p].append(float(scores[pi]))
+                best, best_iou = -1, 0.0
+                for gi, v in enumerate(ious[pi]):
+                    if gi not in matched and gt_cls[gi] == cp and v > best_iou:
+                        best, best_iou = gi, v
+                scores_by_cls[cp].append(float(scores[pi]))
+                hit = best >= 0 and best_iou >= iou_thr
+                if hit:
+                    matched.add(best)
+                matched_by_cls[cp].append(1 if hit else 0)
+
+            # pass 2: confusion at deployment threshold, cross-class
+            matched = set()
+            for pi in order:
+                cp = int(pcls[pi])
+                if cp < 0 or cp >= num_classes or scores[pi] < conf_thr:
+                    continue
+                best, best_iou = -1, 0.0
+                for gi, v in enumerate(ious[pi]):
+                    if gi not in matched and gt_cls[gi] == cp and v > best_iou:
+                        best, best_iou = gi, v
                 if best >= 0 and best_iou >= iou_thr:
-                    matched_gt.add(best)
-                    matched_by_cls[cls_p].append(1)
-                    conf[cls_p, cls_p] += 1
-                    tp_all += 1
+                    matched.add(best)
+                    conf[cp, cp] += 1
+                    continue
+                # other-class GT (matched or not: also catches person+guard duplicates)
+                ob, ob_iou = -1, 0.0
+                for gi, v in enumerate(ious[pi]):
+                    if gt_cls[gi] != cp and v > ob_iou:
+                        ob, ob_iou = gi, v
+                if ob >= 0 and ob_iou >= iou_thr:
+                    conf[cp, int(gt_cls[ob])] += 1
                 else:
-                    matched_by_cls[cls_p].append(0)
-                    # false positive -> background column
-                    conf[cls_p, num_classes] += 1
-                    fp_all += 1
-
+                    conf[cp, num_classes] += 1  # background FP
             for gi in range(len(gt_cls)):
-                if gi not in matched_gt:
-                    cls_g = int(gt_cls[gi])
-                    if 0 <= cls_g < num_classes:
-                        conf[num_classes, cls_g] += 1  # missed GT (FN)
-                        fn_all += 1
+                if gi not in matched and 0 <= gt_cls[gi] < num_classes:
+                    conf[num_classes, int(gt_cls[gi])] += 1  # missed (FN)
 
+        precisions, recalls = [], []
         for c in range(num_classes):
             tp = conf[c, c]
-            fp = conf[c, num_classes]
-            fn = conf[num_classes, c]
-            p = tp / (tp + fp + 1e-6)
-            r = tp / (tp + fn + 1e-6)
-            precisions.append(p)
-            recalls.append(r)
-
-        micro_p = tp_all / (tp_all + fp_all + 1e-6)
-        micro_r = tp_all / (tp_all + fn_all + 1e-6)
+            pred_total = conf[c, :].sum()
+            precisions.append(tp / (pred_total + 1e-6))
+            recalls.append(tp / (gt_count[c] + 1e-6))
+        tp_all = float(np.trace(conf[:num_classes, :num_classes]))
+        micro_p = tp_all / (conf[:num_classes, :].sum() + 1e-6)
+        micro_r = tp_all / (gt_count.sum() + 1e-6)
+        self._gt_count = gt_count
         return conf, precisions, recalls, micro_p, micro_r, scores_by_cls, matched_by_cls
 
     def _plot_confusion_and_pr(self):
@@ -608,7 +643,7 @@ class TrainingReport:
         ax.set_yticklabels(labels)
         ax.set_xlabel("Ground Truth")
         ax.set_ylabel("Prediction")
-        ax.set_title("Confusion matrix (IoU=0.5)")
+        ax.set_title("Confusion matrix (IoU=0.5, score >= %.2f)" % self.report_conf_thr)
         for i in range(conf.shape[0]):
             for j in range(conf.shape[1]):
                 ax.text(j, i, str(conf[i, j]), ha="center", va="center", fontsize=7)
@@ -630,7 +665,7 @@ class TrainingReport:
             tp = np.cumsum(matched)
             fp = np.cumsum(1.0 - matched)
             # TP + FN as GT count
-            gt_count = float(conf[c, c] + conf[-1, c])
+            gt_count = float(self._gt_count[c])
             if gt_count <= 0:
                 continue
             precision = tp / np.maximum(tp + fp, 1e-6)
@@ -644,7 +679,8 @@ class TrainingReport:
         if plotted:
             ax.set_xlabel("Recall")
             ax.set_ylabel("Precision")
-            ax.set_title("Precision-Recall curves (IoU=0.5)")
+            ax.set_title("PR curves (IoU=0.5); P/R in legend at score >= %.2f"
+                         % self.report_conf_thr)
             ax.set_xlim(0, 1.05)
             ax.set_ylim(0, 1.05)
             ax.grid(True, alpha=0.3)
@@ -728,10 +764,22 @@ class TrainingReport:
             f"<li>Epoch: <b>{b.get('epoch')}</b></li>"
             f"<li>AP50: <b>{b.get('ap50')}</b></li>"
             f"<li>AP50-95: <b>{b.get('ap50_95')}</b></li>"
-            f"<li>Selection metric: <code>{b.get('selection_metric')}</code></li>"
+            f"<li>Selection metric: <code>{b.get('selection_metric')}</code>"
+            f" = <b>{b.get('selection_score', b.get('ap50_95'))}</b></li>"
             f"<li>Path: <code>{b.get('checkpoint_path')}</code></li>"
             f"</ul>"
         )
+        pc = b.get("per_class_ap") or {}
+        if pc:
+            best_block += (
+                "<h3>Per-class AP of best checkpoint</h3><table>"
+                "<tr><th>Class</th><th>AP50</th><th>AP50-95</th></tr>"
+                + "".join(
+                    f"<tr><td>{c}</td><td>{v['ap50']}</td><td>{v['ap50_95']}</td></tr>"
+                    for c, v in pc.items()
+                )
+                + "</table><p>Per-epoch values: <code>per_class_ap.csv</code></p>"
+            )
         html = f"""<!DOCTYPE html>
 <html>
 <head>
@@ -751,8 +799,9 @@ class TrainingReport:
   <p>Experiment: <code>{getattr(self.args, "experiment_name", "")}</code></p>
   <p>Best AP50-95: <b>{best}</b>
      {
-        ("| Final Precision: <b>%.3f</b> | Final Recall: <b>%.3f</b>"
-         % (micro_p, micro_r)) if micro_p is not None else ""
+        ("| Final Precision: <b>%.3f</b> | Final Recall: <b>%.3f</b> (score &ge; %.2f)"
+         % (micro_p, micro_r, getattr(self, "report_conf_thr", 0.3)))
+        if micro_p is not None else ""
      }
   </p>
   {best_block}
@@ -778,6 +827,7 @@ class TrainingReport:
   <ul>
     <li><code>training_log.csv</code></li>
     <li><code>best_checkpoint.json</code></li>
+    <li><code>per_class_ap.csv</code></li>
     <li><code>class_analysis.csv</code></li>
     <li><code>dataset_summary.json</code></li>
     <li><code>training_config.yaml</code></li>

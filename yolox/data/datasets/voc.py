@@ -254,9 +254,17 @@ class VOCDetection(CacheDataset):
             0.5, 0.95, int(np.round((0.95 - 0.5) / 0.05)) + 1, endpoint=True
         )
         mAPs = []
+        per_cls = []  # [n_iou][n_cls]
         for iou in IouTh:
             mAP = self._do_python_eval(output_dir, iou)
             mAPs.append(mAP)
+            per_cls.append(list(self._last_class_aps))
+        per_cls = np.array(per_cls, dtype=np.float64)
+        # {class: {"ap50": x, "ap50_95": y}} in 0..1, read by VOCEvaluator / trainer
+        self.per_class_ap = {
+            c: {"ap50": float(per_cls[0, j]), "ap50_95": float(per_cls[:, j].mean())}
+            for j, c in enumerate(c for c in VOC_CLASSES if c != "__background__")
+        }
 
         print("--------------------------------------------------------------")
         print("map_5095:", np.mean(mAPs))
@@ -334,6 +342,7 @@ class VOCDetection(CacheDataset):
             if output_dir is not None:
                 with open(os.path.join(output_dir, cls + "_pr.pkl"), "wb") as f:
                     pickle.dump({"rec": rec, "prec": prec, "ap": ap}, f)
+        self._last_class_aps = [float(a) for a in aps]
         if iou == 0.5:
             print("Mean AP = {:.4f}".format(np.mean(aps)))
             print("~~~~~~~~")

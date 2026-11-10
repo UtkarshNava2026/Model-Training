@@ -1,0 +1,346 @@
+diff --git a/exps/example/yolox_voc/yolox_voc_s.py b/exps/example/yolox_voc/yolox_voc_s.py
+index f680165..4723a4b 100644
+--- a/exps/example/yolox_voc/yolox_voc_s.py
++++ b/exps/example/yolox_voc/yolox_voc_s.py
+@@ -9,8 +9,9 @@ class Exp(MyExp):
+     def __init__(self):
+         super(Exp, self).__init__()
+ 
+-        # Must match yolox/data/datasets/voc_classes.py
+-        self.num_classes = 9
++        # Always in sync with yolox/data/datasets/voc_classes.py
++        from yolox.data.datasets.voc_classes import VOC_CLASSES
++        self.num_classes = len(VOC_CLASSES)
+ 
+         # YOLOX-S scale
+         self.depth = 0.33
+diff --git a/yolox/data/data_augment.py b/yolox/data/data_augment.py
+index 0dbffc0..0a0bc39 100644
+--- a/yolox/data/data_augment.py
++++ b/yolox/data/data_augment.py
+@@ -79,7 +79,7 @@ def get_affine_matrix(
+     return M, scale
+ 
+ 
+-def apply_affine_to_bboxes(targets, target_size, M, scale):
++def apply_affine_to_bboxes(targets, target_size, M, scale, min_area_ratio=0.0):
+     num_gts = len(targets)
+ 
+     # warp corner points
+@@ -102,12 +102,18 @@ def apply_affine_to_bboxes(targets, target_size, M, scale):
+         .T
+     )
+ 
++    area_before = (new_bboxes[:, 2] - new_bboxes[:, 0]) * (new_bboxes[:, 3] - new_bboxes[:, 1])
++
+     # clip boxes
+     new_bboxes[:, 0::2] = new_bboxes[:, 0::2].clip(0, twidth)
+     new_bboxes[:, 1::2] = new_bboxes[:, 1::2].clip(0, theight)
+ 
+     targets[:, :4] = new_bboxes
+ 
++    if min_area_ratio > 0:
++        area_after = (new_bboxes[:, 2] - new_bboxes[:, 0]) * (new_bboxes[:, 3] - new_bboxes[:, 1])
++        targets = targets[area_after > min_area_ratio * np.maximum(area_before, 1e-6)]
++
+     return targets
+ 
+ 
+@@ -119,6 +125,7 @@ def random_affine(
+     translate=0.1,
+     scales=0.1,
+     shear=10,
++    min_area_ratio=0.0,
+ ):
+     M, scale = get_affine_matrix(target_size, degrees, translate, scales, shear)
+ 
+@@ -126,7 +133,7 @@ def random_affine(
+ 
+     # Transform label coordinates
+     if len(targets) > 0:
+-        targets = apply_affine_to_bboxes(targets, target_size, M, scale)
++        targets = apply_affine_to_bboxes(targets, target_size, M, scale, min_area_ratio)
+ 
+     return img, targets
+ 
+@@ -159,12 +166,16 @@ def preproc(img, input_size, swap=(2, 0, 1)):
+ 
+ 
+ class TrainTransform:
+-    def __init__(self, max_labels=50, flip_prob=0.5, hsv_prob=1.0, weather_prob=0.0):
++    def __init__(self, max_labels=50, flip_prob=0.5, hsv_prob=1.0, weather_prob=0.0,
++                 no_fog_class_ids=()):
+         self.max_labels = max_labels
+         self.flip_prob = flip_prob
+         self.hsv_prob = hsv_prob
+         # Independently apply heavy rain and fog, each with this probability.
+         self.weather_prob = weather_prob
++        # Never fog a sample that contains any of these class ids (e.g. disinfection mist:
++        # global fog washes out the plume while its box stays => wrong label).
++        self.no_fog_class_ids = set(int(c) for c in no_fog_class_ids)
+         self.rain_tf = None
+         self.fog_tf = None
+         if weather_prob > 0:
+@@ -195,13 +206,16 @@ class TrainTransform:
+                 ]
+             )
+ 
+-    def _apply_weather(self, image):
++    def _apply_weather(self, image, labels=None):
+         """Apply heavy rain and fog independently on uint8 BGR. No normalization."""
+         if self.weather_prob <= 0:
+             return image
+ 
+         apply_rain = self.rain_tf is not None and random.random() < self.weather_prob
+         apply_fog = self.fog_tf is not None and random.random() < self.weather_prob
++        if apply_fog and self.no_fog_class_ids and labels is not None and len(labels):
++            if self.no_fog_class_ids & set(np.asarray(labels).astype(int).tolist()):
++                apply_fog = False
+         if not apply_rain and not apply_fog:
+             return image
+ 
+@@ -231,7 +245,7 @@ class TrainTransform:
+ 
+         if random.random() < self.hsv_prob:
+             augment_hsv(image)
+-        self._apply_weather(image)
++        self._apply_weather(image, labels)
+         image_t, boxes = _mirror(image, boxes, self.flip_prob)
+         height, width, _ = image_t.shape
+         image_t, r_ = preproc(image_t, input_dim)
+diff --git a/yolox/data/datasets/mosaicdetection.py b/yolox/data/datasets/mosaicdetection.py
+index 708babe..00fe3e6 100644
+--- a/yolox/data/datasets/mosaicdetection.py
++++ b/yolox/data/datasets/mosaicdetection.py
+@@ -13,6 +13,12 @@ from ..data_augment import random_affine
+ from .datasets_wrapper import Dataset
+ 
+ 
++def box_area(labels):
++    return np.clip(labels[:, 2] - labels[:, 0], 0, None) * np.clip(
++        labels[:, 3] - labels[:, 1], 0, None
++    )
++
++
+ def get_mosaic_coordinate(mosaic_image, mosaic_index, xc, yc, w, h, input_h, input_w):
+     # TODO update doc
+     # index0 to top left part of image
+@@ -41,7 +47,7 @@ class MosaicDetection(Dataset):
+         self, dataset, img_size, mosaic=True, preproc=None,
+         degrees=10.0, translate=0.1, mosaic_scale=(0.5, 1.5),
+         mixup_scale=(0.5, 1.5), shear=2.0, enable_mixup=True,
+-        mosaic_prob=1.0, mixup_prob=1.0, *args
++        mosaic_prob=1.0, mixup_prob=1.0, min_box_area_ratio=0.0, *args
+     ):
+         """
+ 
+@@ -70,6 +76,7 @@ class MosaicDetection(Dataset):
+         self.enable_mixup = enable_mixup
+         self.mosaic_prob = mosaic_prob
+         self.mixup_prob = mixup_prob
++        self.min_box_area_ratio = min_box_area_ratio
+         self.local_rank = get_local_rank()
+ 
+     def __len__(self):
+@@ -120,10 +127,14 @@ class MosaicDetection(Dataset):
+ 
+             if len(mosaic_labels):
+                 mosaic_labels = np.concatenate(mosaic_labels, 0)
++                area_before = box_area(mosaic_labels)
+                 np.clip(mosaic_labels[:, 0], 0, 2 * input_w, out=mosaic_labels[:, 0])
+                 np.clip(mosaic_labels[:, 1], 0, 2 * input_h, out=mosaic_labels[:, 1])
+                 np.clip(mosaic_labels[:, 2], 0, 2 * input_w, out=mosaic_labels[:, 2])
+                 np.clip(mosaic_labels[:, 3], 0, 2 * input_h, out=mosaic_labels[:, 3])
++                if self.min_box_area_ratio > 0 and len(mosaic_labels):
++                    keep = box_area(mosaic_labels) > self.min_box_area_ratio * area_before
++                    mosaic_labels = mosaic_labels[keep]
+ 
+             mosaic_img, mosaic_labels = random_affine(
+                 mosaic_img,
+@@ -133,6 +144,7 @@ class MosaicDetection(Dataset):
+                 translate=self.translate,
+                 scales=self.scale,
+                 shear=self.shear,
++                min_area_ratio=self.min_box_area_ratio,
+             )
+ 
+             # -----------------------------------------------------------------
+diff --git a/yolox/data/datasets/voc_classes.py b/yolox/data/datasets/voc_classes.py
+index 7bb5260..befee6d 100644
+--- a/yolox/data/datasets/voc_classes.py
++++ b/yolox/data/datasets/voc_classes.py
+@@ -2,15 +2,18 @@
+ # -*- coding:utf-8 -*-
+ # Copyright (c) Megvii, Inc. and its affiliates.
+ 
++# Index order here == class id order in the trained model / ONNX / TensorRT engine.
++# Keep DeepStream labels.txt and any class-id mapping in the pipeline in this exact order.
+ # VOC_CLASSES = ( '__background__', # always index 0
+ VOC_CLASSES = (
+-    "auto",
+-    "bike",
+-    "car",
+-    "disinfection",
+-    "jcb",
+-    "person",
+-    "security_guard",
+-    "tractor",
+-    "truck",
++    "auto",            # 0
++    "bike",            # 1
++    "car",             # 2
++    "disinfection",    # 3
++    "jcb",             # 4
++    "license_plate",   # 5
++    "person",          # 6
++    "security_guard",  # 7
++    "tractor",         # 8
++    "truck",           # 9
+ )
+diff --git a/yolox/evaluators/voc_eval.py b/yolox/evaluators/voc_eval.py
+index d1a4748..0ba658b 100644
+--- a/yolox/evaluators/voc_eval.py
++++ b/yolox/evaluators/voc_eval.py
+@@ -11,28 +11,57 @@ import xml.etree.ElementTree as ET
+ import numpy as np
+ 
+ 
++def _int_text(node, tag, default=0):
++    el = node.find(tag)
++    if el is None or el.text is None or el.text.strip() == "":
++        return default
++    return int(float(el.text))
++
++
+ def parse_rec(filename):
+-    """Parse a PASCAL VOC xml file"""
++    """Parse a PASCAL VOC xml file.
++
++    Tolerant to labelling-tool output: float coordinates ("123.5") and missing
++    <pose>/<truncated>/<difficult> tags (both used to crash evaluation).
++    Uses the same coordinate convention as AnnotationTransform (int(float(x))).
++    """
+     tree = ET.parse(filename)
+     objects = []
+     for obj in tree.findall("object"):
+         obj_struct = {}
+-        obj_struct["name"] = obj.find("name").text
+-        obj_struct["pose"] = obj.find("pose").text
+-        obj_struct["truncated"] = int(obj.find("truncated").text)
+-        obj_struct["difficult"] = int(obj.find("difficult").text)
++        obj_struct["name"] = obj.find("name").text.strip()
++        pose = obj.find("pose")
++        obj_struct["pose"] = pose.text if pose is not None else "Unspecified"
++        obj_struct["truncated"] = _int_text(obj, "truncated")
++        obj_struct["difficult"] = _int_text(obj, "difficult")
+         bbox = obj.find("bndbox")
+         obj_struct["bbox"] = [
+-            int(bbox.find("xmin").text),
+-            int(bbox.find("ymin").text),
+-            int(bbox.find("xmax").text),
+-            int(bbox.find("ymax").text),
++            _int_text(bbox, "xmin"),
++            _int_text(bbox, "ymin"),
++            _int_text(bbox, "xmax"),
++            _int_text(bbox, "ymax"),
+         ]
+         objects.append(obj_struct)
+ 
+     return objects
+ 
+ 
++def _cache_is_stale(cachefile, imagesetfile, annopath, imagenames):
++    """GT cache must be rebuilt if the split file or any val XML changed after it was written.
++    The original code reused annots.pkl forever, so relabelled / newly added classes
++    (e.g. license_plate) were silently evaluated against OLD ground truth."""
++    if not os.path.isfile(cachefile):
++        return True
++    cache_mtime = os.path.getmtime(cachefile)
++    if os.path.getmtime(imagesetfile) > cache_mtime:
++        return True
++    for name in imagenames:
++        p = annopath.format(name)
++        if os.path.isfile(p) and os.path.getmtime(p) > cache_mtime:
++            return True
++    return False
++
++
+ def voc_ap(rec, prec, use_07_metric=False):
+     """
+     Compute VOC AP given precision and recall.
+@@ -85,7 +114,14 @@ def voc_eval(
+         lines = f.readlines()
+     imagenames = [x.strip() for x in lines]
+ 
+-    if not os.path.isfile(cachefile):
++    stale = _cache_is_stale(cachefile, imagesetfile, annopath, imagenames)
++    recs = None
++    if not stale:
++        with open(cachefile, "rb") as f:
++            recs = pickle.load(f)
++        if set(recs.keys()) != set(imagenames):
++            recs = None
++    if recs is None:
+         # load annots
+         recs = {}
+         for i, imagename in enumerate(imagenames):
+@@ -96,10 +132,6 @@ def voc_eval(
+         print(f"Saving cached annotations to {cachefile}")
+         with open(cachefile, "wb") as f:
+             pickle.dump(recs, f)
+-    else:
+-        # load
+-        with open(cachefile, "rb") as f:
+-            recs = pickle.load(f)
+ 
+     # extract gt objects for this class
+     class_recs = {}
+diff --git a/yolox/exp/yolox_base.py b/yolox/exp/yolox_base.py
+index d889a8a..61088f1 100644
+--- a/yolox/exp/yolox_base.py
++++ b/yolox/exp/yolox_base.py
+@@ -57,6 +57,8 @@ class Exp(BaseExp):
+         self.flip_prob = 0.5
+         # prob of applying Albumentations rain/fog (uint8, no normalize)
+         self.weather_prob = 0.0
++        # class ids that must never receive fog augmentation (empty = fog any sample)
++        self.no_fog_class_ids = ()
+         # rotation angle range, for example, if set to 2, the true range is (-2, 2)
+         self.degrees = 10.0
+         # translate range, for example, if set to 0.1, the true range is (-0.1, 0.1)
+@@ -67,6 +69,9 @@ class Exp(BaseExp):
+         self.mixup_scale = (0.5, 1.5)
+         # shear angle range, for example, if set to 2, the true range is (-2, 2)
+         self.shear = 2.0
++        # drop boxes whose area after mosaic crop / affine clip is below this fraction of
++        # their un-clipped area (0 disables, i.e. original YOLOX behaviour)
++        self.min_box_area_ratio = 0.0
+ 
+         # --------------  training config --------------------- #
+         # epoch number used for warmup
+@@ -150,6 +155,7 @@ class Exp(BaseExp):
+                 flip_prob=self.flip_prob,
+                 hsv_prob=self.hsv_prob,
+                 weather_prob=self.weather_prob,
++                no_fog_class_ids=getattr(self, "no_fog_class_ids", ()),
+             ),
+             cache=cache,
+             cache_type=cache_type,
+@@ -191,7 +197,8 @@ class Exp(BaseExp):
+                 max_labels=120,
+                 flip_prob=self.flip_prob,
+                 hsv_prob=self.hsv_prob,
+-                weather_prob=self.weather_prob),
++                weather_prob=self.weather_prob,
++                no_fog_class_ids=getattr(self, "no_fog_class_ids", ())),
+             degrees=self.degrees,
+             translate=self.translate,
+             mosaic_scale=self.mosaic_scale,
+@@ -200,6 +207,7 @@ class Exp(BaseExp):
+             enable_mixup=self.enable_mixup,
+             mosaic_prob=self.mosaic_prob,
+             mixup_prob=self.mixup_prob,
++            min_box_area_ratio=getattr(self, "min_box_area_ratio", 0.0),
+         )
+ 
+         if is_distributed:

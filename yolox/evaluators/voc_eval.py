@@ -11,26 +11,55 @@ import xml.etree.ElementTree as ET
 import numpy as np
 
 
+def _int_text(node, tag, default=0):
+    el = node.find(tag)
+    if el is None or el.text is None or el.text.strip() == "":
+        return default
+    return int(float(el.text))
+
+
 def parse_rec(filename):
-    """Parse a PASCAL VOC xml file"""
+    """Parse a PASCAL VOC xml file.
+
+    Tolerant to labelling-tool output: float coordinates ("123.5") and missing
+    <pose>/<truncated>/<difficult> tags (both used to crash evaluation).
+    Uses the same coordinate convention as AnnotationTransform (int(float(x))).
+    """
     tree = ET.parse(filename)
     objects = []
     for obj in tree.findall("object"):
         obj_struct = {}
-        obj_struct["name"] = obj.find("name").text
-        obj_struct["pose"] = obj.find("pose").text
-        obj_struct["truncated"] = int(obj.find("truncated").text)
-        obj_struct["difficult"] = int(obj.find("difficult").text)
+        obj_struct["name"] = obj.find("name").text.strip()
+        pose = obj.find("pose")
+        obj_struct["pose"] = pose.text if pose is not None else "Unspecified"
+        obj_struct["truncated"] = _int_text(obj, "truncated")
+        obj_struct["difficult"] = _int_text(obj, "difficult")
         bbox = obj.find("bndbox")
         obj_struct["bbox"] = [
-            int(bbox.find("xmin").text),
-            int(bbox.find("ymin").text),
-            int(bbox.find("xmax").text),
-            int(bbox.find("ymax").text),
+            _int_text(bbox, "xmin"),
+            _int_text(bbox, "ymin"),
+            _int_text(bbox, "xmax"),
+            _int_text(bbox, "ymax"),
         ]
         objects.append(obj_struct)
 
     return objects
+
+
+def _cache_is_stale(cachefile, imagesetfile, annopath, imagenames):
+    """GT cache must be rebuilt if the split file or any val XML changed after it was written.
+    The original code reused annots.pkl forever, so relabelled / newly added classes
+    (e.g. license_plate) were silently evaluated against OLD ground truth."""
+    if not os.path.isfile(cachefile):
+        return True
+    cache_mtime = os.path.getmtime(cachefile)
+    if os.path.getmtime(imagesetfile) > cache_mtime:
+        return True
+    for name in imagenames:
+        p = annopath.format(name)
+        if os.path.isfile(p) and os.path.getmtime(p) > cache_mtime:
+            return True
+    return False
 
 
 def voc_ap(rec, prec, use_07_metric=False):
@@ -85,7 +114,14 @@ def voc_eval(
         lines = f.readlines()
     imagenames = [x.strip() for x in lines]
 
-    if not os.path.isfile(cachefile):
+    stale = _cache_is_stale(cachefile, imagesetfile, annopath, imagenames)
+    recs = None
+    if not stale:
+        with open(cachefile, "rb") as f:
+            recs = pickle.load(f)
+        if set(recs.keys()) != set(imagenames):
+            recs = None
+    if recs is None:
         # load annots
         recs = {}
         for i, imagename in enumerate(imagenames):
@@ -96,10 +132,6 @@ def voc_eval(
         print(f"Saving cached annotations to {cachefile}")
         with open(cachefile, "wb") as f:
             pickle.dump(recs, f)
-    else:
-        # load
-        with open(cachefile, "rb") as f:
-            recs = pickle.load(f)
 
     # extract gt objects for this class
     class_recs = {}

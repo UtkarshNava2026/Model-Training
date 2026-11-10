@@ -79,7 +79,7 @@ def get_affine_matrix(
     return M, scale
 
 
-def apply_affine_to_bboxes(targets, target_size, M, scale):
+def apply_affine_to_bboxes(targets, target_size, M, scale, min_area_ratio=0.0):
     num_gts = len(targets)
 
     # warp corner points
@@ -102,11 +102,17 @@ def apply_affine_to_bboxes(targets, target_size, M, scale):
         .T
     )
 
+    area_before = (new_bboxes[:, 2] - new_bboxes[:, 0]) * (new_bboxes[:, 3] - new_bboxes[:, 1])
+
     # clip boxes
     new_bboxes[:, 0::2] = new_bboxes[:, 0::2].clip(0, twidth)
     new_bboxes[:, 1::2] = new_bboxes[:, 1::2].clip(0, theight)
 
     targets[:, :4] = new_bboxes
+
+    if min_area_ratio > 0:
+        area_after = (new_bboxes[:, 2] - new_bboxes[:, 0]) * (new_bboxes[:, 3] - new_bboxes[:, 1])
+        targets = targets[area_after > min_area_ratio * np.maximum(area_before, 1e-6)]
 
     return targets
 
@@ -119,6 +125,7 @@ def random_affine(
     translate=0.1,
     scales=0.1,
     shear=10,
+    min_area_ratio=0.0,
 ):
     M, scale = get_affine_matrix(target_size, degrees, translate, scales, shear)
 
@@ -126,7 +133,7 @@ def random_affine(
 
     # Transform label coordinates
     if len(targets) > 0:
-        targets = apply_affine_to_bboxes(targets, target_size, M, scale)
+        targets = apply_affine_to_bboxes(targets, target_size, M, scale, min_area_ratio)
 
     return img, targets
 
@@ -159,12 +166,16 @@ def preproc(img, input_size, swap=(2, 0, 1)):
 
 
 class TrainTransform:
-    def __init__(self, max_labels=50, flip_prob=0.5, hsv_prob=1.0, weather_prob=0.0):
+    def __init__(self, max_labels=50, flip_prob=0.5, hsv_prob=1.0, weather_prob=0.0,
+                 no_fog_class_ids=()):
         self.max_labels = max_labels
         self.flip_prob = flip_prob
         self.hsv_prob = hsv_prob
         # Independently apply heavy rain and fog, each with this probability.
         self.weather_prob = weather_prob
+        # Never fog a sample that contains any of these class ids (e.g. disinfection mist:
+        # global fog washes out the plume while its box stays => wrong label).
+        self.no_fog_class_ids = set(int(c) for c in no_fog_class_ids)
         self.rain_tf = None
         self.fog_tf = None
         if weather_prob > 0:
@@ -195,13 +206,16 @@ class TrainTransform:
                 ]
             )
 
-    def _apply_weather(self, image):
+    def _apply_weather(self, image, labels=None):
         """Apply heavy rain and fog independently on uint8 BGR. No normalization."""
         if self.weather_prob <= 0:
             return image
 
         apply_rain = self.rain_tf is not None and random.random() < self.weather_prob
         apply_fog = self.fog_tf is not None and random.random() < self.weather_prob
+        if apply_fog and self.no_fog_class_ids and labels is not None and len(labels):
+            if self.no_fog_class_ids & set(np.asarray(labels).astype(int).tolist()):
+                apply_fog = False
         if not apply_rain and not apply_fog:
             return image
 
@@ -231,7 +245,7 @@ class TrainTransform:
 
         if random.random() < self.hsv_prob:
             augment_hsv(image)
-        self._apply_weather(image)
+        self._apply_weather(image, labels)
         image_t, boxes = _mirror(image, boxes, self.flip_prob)
         height, width, _ = image_t.shape
         image_t, r_ = preproc(image_t, input_dim)

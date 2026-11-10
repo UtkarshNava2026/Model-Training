@@ -56,6 +56,8 @@ class Trainer:
         self.data_type = torch.float16 if args.fp16 else torch.float32
         self.input_size = exp.input_size
         self.best_ap = 0
+        # score used to pick best_ckpt.pth (weighted per-class AP50:95 if configured)
+        self.best_score = 0
 
         # metric record
         self.meter = MeterBuffer(window_size=exp.print_interval)
@@ -374,6 +376,7 @@ class Trainer:
             model.load_state_dict(ckpt["model"])
             self.optimizer.load_state_dict(ckpt["optimizer"])
             self.best_ap = ckpt.pop("best_ap", 0)
+            self.best_score = ckpt.pop("best_score", self.best_ap)
             # resume the training states variables
             start_epoch = (
                 self.args.start_epoch - 1
@@ -409,13 +412,27 @@ class Trainer:
                 evalmodel, self.evaluator, self.is_distributed, return_outputs=True
             )
 
-        update_best_ckpt = ap50_95 > self.best_ap
+        per_class = getattr(self.evaluator, "per_class_ap", None)
+        score, metric_name = self.selection_score(ap50_95, per_class)
+        update_best_ckpt = score > self.best_score
+        self.best_score = max(self.best_score, score)
         self.best_ap = max(self.best_ap, ap50_95)
+        if self.rank == 0:
+            logger.info(
+                "selection metric {} = {:.2f} (best {:.2f}){}".format(
+                    metric_name, 100 * score, 100 * self.best_score,
+                    "  -> new best_ckpt" if update_best_ckpt else "",
+                )
+            )
 
         if self.rank == 0:
             if self.args.logger == "tensorboard":
                 self.tblogger.add_scalar("val/COCOAP50", ap50, self.epoch + 1)
                 self.tblogger.add_scalar("val/COCOAP50_95", ap50_95, self.epoch + 1)
+                self.tblogger.add_scalar("val/selection_score", score, self.epoch + 1)
+                for c, v in (per_class or {}).items():
+                    self.tblogger.add_scalar(f"val_AP50/{c}", v["ap50"], self.epoch + 1)
+                    self.tblogger.add_scalar(f"val_AP50_95/{c}", v["ap50_95"], self.epoch + 1)
             if self.args.logger == "wandb":
                 self.wandb_logger.log_metrics({
                     "val/COCOAP50": ap50,
@@ -442,6 +459,9 @@ class Trainer:
                         predictions=predictions,
                         is_best=bool(update_best_ckpt),
                         ckpt_dir=self.file_name,
+                        per_class_ap=per_class,
+                        selection_metric=metric_name,
+                        selection_score=float(score),
                     )
                 except Exception as e:
                     logger.warning("Training report eval log failed: {}".format(e))
@@ -462,6 +482,23 @@ class Trainer:
             self.mlflow_logger.save_checkpoints(self.args, self.exp, self.file_name, self.epoch,
                                                 metadata, update_best_ckpt)
 
+    def selection_score(self, ap50_95, per_class):
+        """Metric that decides best_ckpt.pth.
+
+        exp.best_ckpt_class_weights = {"disinfection": 2.0, ...} -> weighted mean of
+        per-class AP50:95 (unlisted classes weigh 1.0). Otherwise plain mAP50:95.
+        """
+        weights = getattr(self.exp, "best_ckpt_class_weights", None)
+        if not weights or not per_class:
+            return float(ap50_95), "ap50_95"
+        num = den = 0.0
+        for c, v in per_class.items():
+            w = float(weights.get(c, 1.0))
+            num += w * v["ap50_95"]
+            den += w
+        tag = ",".join(f"{k}x{v:g}" for k, v in weights.items())
+        return (num / den if den else float(ap50_95)), f"weighted_ap50_95[{tag}]"
+
     def save_ckpt(self, ckpt_name, update_best_ckpt=False, ap=None):
         if self.rank == 0:
             save_model = self.ema_model.ema if self.use_model_ema else self.model
@@ -471,6 +508,7 @@ class Trainer:
                 "model": save_model.state_dict(),
                 "optimizer": self.optimizer.state_dict(),
                 "best_ap": self.best_ap,
+                "best_score": self.best_score,
                 "curr_ap": ap,
             }
             save_checkpoint(

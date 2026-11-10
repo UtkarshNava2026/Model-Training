@@ -9,8 +9,9 @@ class Exp(MyExp):
     def __init__(self):
         super(Exp, self).__init__()
 
-        # Must match yolox/data/datasets/voc_classes.py
-        self.num_classes = 9
+        # Always in sync with yolox/data/datasets/voc_classes.py
+        from yolox.data.datasets.voc_classes import VOC_CLASSES
+        self.num_classes = len(VOC_CLASSES)
 
         # YOLOX-S scale
         self.depth = 0.33
@@ -37,6 +38,8 @@ class Exp(MyExp):
         self.flip_prob = 0.5
         # Albumentations: heavy rain and fog each on ~10% of samples
         self.weather_prob = 0.1
+        # never fog a sample that contains disinfection
+        self.no_fog_class_ids = (VOC_CLASSES.index("disinfection"),)
 
         self.exp_name = os.path.split(os.path.realpath(__file__))[1].split(".")[0]
 
@@ -52,6 +55,7 @@ class Exp(MyExp):
                 flip_prob=self.flip_prob,
                 hsv_prob=self.hsv_prob,
                 weather_prob=self.weather_prob,
+                no_fog_class_ids=self.no_fog_class_ids,
             ),
             cache=cache,
             cache_type=cache_type,

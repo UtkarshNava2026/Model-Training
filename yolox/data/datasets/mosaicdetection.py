@@ -13,6 +13,12 @@ from ..data_augment import random_affine
 from .datasets_wrapper import Dataset
 
 
+def box_area(labels):
+    return np.clip(labels[:, 2] - labels[:, 0], 0, None) * np.clip(
+        labels[:, 3] - labels[:, 1], 0, None
+    )
+
+
 def get_mosaic_coordinate(mosaic_image, mosaic_index, xc, yc, w, h, input_h, input_w):
     # TODO update doc
     # index0 to top left part of image
@@ -41,7 +47,7 @@ class MosaicDetection(Dataset):
         self, dataset, img_size, mosaic=True, preproc=None,
         degrees=10.0, translate=0.1, mosaic_scale=(0.5, 1.5),
         mixup_scale=(0.5, 1.5), shear=2.0, enable_mixup=True,
-        mosaic_prob=1.0, mixup_prob=1.0, *args
+        mosaic_prob=1.0, mixup_prob=1.0, min_box_area_ratio=0.0, *args
     ):
         """
 
@@ -70,6 +76,7 @@ class MosaicDetection(Dataset):
         self.enable_mixup = enable_mixup
         self.mosaic_prob = mosaic_prob
         self.mixup_prob = mixup_prob
+        self.min_box_area_ratio = min_box_area_ratio
         self.local_rank = get_local_rank()
 
     def __len__(self):
@@ -120,10 +127,14 @@ class MosaicDetection(Dataset):
 
             if len(mosaic_labels):
                 mosaic_labels = np.concatenate(mosaic_labels, 0)
+                area_before = box_area(mosaic_labels)
                 np.clip(mosaic_labels[:, 0], 0, 2 * input_w, out=mosaic_labels[:, 0])
                 np.clip(mosaic_labels[:, 1], 0, 2 * input_h, out=mosaic_labels[:, 1])
                 np.clip(mosaic_labels[:, 2], 0, 2 * input_w, out=mosaic_labels[:, 2])
                 np.clip(mosaic_labels[:, 3], 0, 2 * input_h, out=mosaic_labels[:, 3])
+                if self.min_box_area_ratio > 0 and len(mosaic_labels):
+                    keep = box_area(mosaic_labels) > self.min_box_area_ratio * area_before
+                    mosaic_labels = mosaic_labels[keep]
 
             mosaic_img, mosaic_labels = random_affine(
                 mosaic_img,
@@ -133,6 +144,7 @@ class MosaicDetection(Dataset):
                 translate=self.translate,
                 scales=self.scale,
                 shear=self.shear,
+                min_area_ratio=self.min_box_area_ratio,
             )
 
             # -----------------------------------------------------------------
